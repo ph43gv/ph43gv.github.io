@@ -22,6 +22,8 @@
   .install b { color: #fff; }
   body.installing .install { display: block; }
   body.installing #auto { display: none; }
+  /* The app runs full screen inside this page, so its login can be kept here (see the script). */
+  #app { position: fixed; inset: 0; width: 100%; height: 100%; border: 0; background: #fff; }
 </style>
 </head>
 <body>
@@ -43,8 +45,31 @@
     // so the saved icon opens the plain address, which redirects straight to the directory.
     document.body.className = 'installing';
     history.replaceState(null, '', location.pathname);
+  } else if (window.top !== window.self) {
+    // Framed by another page: never show the app here (clickjacking). Offer the real page instead.
+    document.getElementById('open').target = '_top';
+    document.getElementById('auto').textContent = 'Abra el directorio en su propia ventana.';
   } else {
-    location.replace(APP_URL);
+    // Safari forgets storage inside Google's frame on every restart, so the app hands its login token
+    // to this page, whose storage the browser keeps. Only the app's frame inside our iframe is answered.
+    var KEY = 'ph_token';
+    var frame = document.createElement('iframe');
+    frame.id = 'app';
+    frame.title = 'PH 43 GV';
+    var fromApp = function (e) {
+      if (!/^https:\/\/[a-z0-9-]+-script\.googleusercontent\.com$/.test(e.origin)) return false;
+      for (var w = e.source, i = 0; w && i < 5; i++) { if (w === frame.contentWindow) return true; if (w === w.parent) break; w = w.parent; }
+      return false;
+    };
+    var store = function (fn) { try { return fn(window.localStorage); } catch (err) { return null; } };
+    window.addEventListener('message', function (e) {
+      if (!e.data || typeof e.data.ph !== 'string' || !fromApp(e)) return;
+      if (e.data.ph === 'get') e.source.postMessage({ ph: 'token', token: store(function (s) { return s.getItem(KEY); }) || '' }, e.origin);
+      else if (e.data.ph === 'set' && /^[0-9a-f]{64}$/i.test(String(e.data.token))) store(function (s) { s.setItem(KEY, e.data.token); });
+      else if (e.data.ph === 'del') store(function (s) { s.removeItem(KEY); });
+    });
+    frame.src = APP_URL;
+    document.body.appendChild(frame);
   }
 </script>
 </body>
