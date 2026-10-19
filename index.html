@@ -62,11 +62,64 @@
       return false;
     };
     var store = function (fn) { try { return fn(window.localStorage); } catch (err) { return null; } };
+    var readToken = function () { return store(function (s) { return s.getItem(KEY); }) || ''; };
+
+    // Device key (see checkProof_ in Code.gs): kept here as a non-extractable key next to the token.
+    // The app sends the secret once; afterwards this page only returns signatures, never the key.
+    var CAN_KEY = !!(window.crypto && crypto.subtle && window.indexedDB && window.TextEncoder);
+    var idb = function (fn) {
+      return new Promise(function (res, rej) {
+        var open = indexedDB.open('ph', 1);
+        open.onupgradeneeded = function () { open.result.createObjectStore('k'); };
+        open.onerror = function () { rej(open.error); };
+        open.onsuccess = function () {
+          var db = open.result, tx = db.transaction('k', 'readwrite'), r = fn(tx.objectStore('k'));
+          tx.oncomplete = function () { db.close(); res(r && r.result); };
+          tx.onerror = tx.onabort = function () { db.close(); rej(tx.error || new Error('idb')); };
+        };
+      });
+    };
+    var importKey = function (raw) { return crypto.subtle.importKey('raw', raw, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']); };
+    var fromB64 = function (t) { var b = atob(t), a = new Uint8Array(b.length); for (var i = 0; i < b.length; i++) a[i] = b.charCodeAt(i); return a; };
+    var toB64 = function (buf) { var a = new Uint8Array(buf), t = ''; for (var i = 0; i < a.length; i++) t += String.fromCharCode(a[i]); return btoa(t); };
+    // Store and read back a throwaway key first: a session is never bound to a key this browser cannot keep.
+    var keyCheck = !CAN_KEY ? Promise.resolve(false) : importKey(crypto.getRandomValues(new Uint8Array(32)))
+      .then(function (k) { return idb(function (st) { return st.put(k, 'test'); }); })
+      .then(function () { return idb(function (st) { return st.get('test'); }); })
+      .then(function (k) { return idb(function (st) { return st.delete('test'); }).then(function () { return !!k && k.type === 'secret'; }); })
+      .catch(function () { return false; });
+    var getKey = function () { return CAN_KEY ? idb(function (st) { return st.get('device'); }).catch(function () { return null; }) : Promise.resolve(null); };
+    var dropKey = function () { return CAN_KEY ? idb(function (st) { return st.delete('device'); }).catch(function () {}) : Promise.resolve(); };
+    var OK = function () { return { ok: true }; };
+
+    var handle = function (d) {
+      if (d.ph === 'get') return Promise.all([keyCheck, getKey()]).then(function (v) {
+        return { ph: 'token', token: readToken(), key: !!v[1], canKey: v[0] };
+      });
+      if (d.ph === 'set' && /^[0-9a-f]{64}$/i.test(String(d.token))) {
+        var same = readToken() === d.token;
+        store(function (s) { s.setItem(KEY, d.token); });
+        return (same ? Promise.resolve() : dropKey()).then(OK);  // a new session never reuses the old key
+      }
+      if (d.ph === 'del') { store(function (s) { s.removeItem(KEY); }); return dropKey().then(OK); }
+      if (d.ph === 'bind' && CAN_KEY && typeof d.secret === 'string' && /^[A-Za-z0-9+\/]{43}=$/.test(d.secret)) {
+        return importKey(fromB64(d.secret)).then(function (k) { return idb(function (st) { return st.put(k, 'device'); }); }).then(OK);
+      }
+      if (d.ph === 'sign' && typeof d.msg === 'string' && /^\d{10,16}\.[A-Za-z]{1,40}$/.test(d.msg)) {
+        return getKey().then(function (k) {
+          return k ? crypto.subtle.sign('HMAC', k, new TextEncoder().encode(d.msg)).then(function (sig) { return { sig: toB64(sig) }; }) : {};
+        });
+      }
+      return Promise.resolve({});
+    };
+    // One message at a time, in order: a "set" or "del" is finished before the next "get" or "sign".
+    var queue = Promise.resolve();
     window.addEventListener('message', function (e) {
       if (!e.data || typeof e.data.ph !== 'string' || !fromApp(e)) return;
-      if (e.data.ph === 'get') e.source.postMessage({ ph: 'token', token: store(function (s) { return s.getItem(KEY); }) || '' }, e.origin);
-      else if (e.data.ph === 'set' && /^[0-9a-f]{64}$/i.test(String(e.data.token))) store(function (s) { s.setItem(KEY, e.data.token); });
-      else if (e.data.ph === 'del') store(function (s) { s.removeItem(KEY); });
+      var d = e.data, src = e.source, origin = e.origin;
+      queue = queue.then(function () { return handle(d); })
+        .catch(function () { return { ok: false }; })
+        .then(function (r) { r.n = d.n; src.postMessage(r, origin); });
     });
     frame.src = APP_URL;
     document.body.appendChild(frame);
